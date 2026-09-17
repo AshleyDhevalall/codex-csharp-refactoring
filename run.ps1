@@ -314,96 +314,248 @@ function Stop-ProcessesUsingRepository {
 }
 
 function Reset-RepositoryToCommittedState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RepositoryPath
+    )
+
     Write-Host ""
-    Write-Host "Resetting Working Repository (Baseline Copy)" -ForegroundColor Cyan
+    Write-Host "Resetting Working Repository to Git HEAD" -ForegroundColor Cyan
 
-    $BaselineRepository = Join-Path $ProjectRoot "original-repository"
-    $SampleRepository = Join-Path $ProjectRoot "sample-repository"
+    $Repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
 
-    if (-not (Test-Path -LiteralPath $BaselineRepository -PathType Container)) {
-        # First-run bootstrap: if the ZIP contains a sample-repository but no
-        # original-repository, preserve that sample as the immutable baseline.
-        # This removes the Git dependency and means the exercise works immediately
-        # after extraction.
-        if (Test-Path -LiteralPath $SampleRepository -PathType Container) {
-            Write-Host "[INIT] original-repository not found." -ForegroundColor Yellow
-            Write-Host "[INIT] Creating pristine baseline from sample-repository..." -ForegroundColor DarkGray
+    # ------------------------------------------------------------
+    # Validate repository location
+    # ------------------------------------------------------------
 
-            New-Item -ItemType Directory -Path $BaselineRepository -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $Repository -PathType Container)) {
+        throw "Repository directory does not exist: $Repository"
+    }
 
-            $robocopyInit = Get-Command robocopy.exe -ErrorAction SilentlyContinue
-            if ($robocopyInit) {
-                & $robocopyInit.Source $SampleRepository $BaselineRepository /E /R:2 /W:1 /XJ /NFL /NDL /NJH /NJS
-                $initRc = $LASTEXITCODE
-                if ($initRc -ge 8) {
-                    throw "Initial baseline copy failed with Robocopy exit code $initRc."
+    $gitDirectory = Join-Path $Repository ".git"
+
+    if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
+        throw "The repository does not contain a .git directory: $Repository"
+    }
+
+    # ------------------------------------------------------------
+    # Validate expected repository structure
+    # ------------------------------------------------------------
+
+    $solutionPath = Join-Path $Repository "OrderProcessing.sln"
+    $srcPath      = Join-Path $Repository "src"
+    $testPath     = Join-Path $Repository "tests"
+
+    if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
+        throw "Expected solution file was not found: $solutionPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $srcPath -PathType Container)) {
+        throw "Expected src directory was not found: $srcPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $testPath -PathType Container)) {
+        throw "Expected tests directory was not found: $testPath"
+    }
+
+    Write-Host "[OK] Git repository validated." -ForegroundColor Green
+
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+
+    if (-not $gitCommand) {
+        throw "Git executable was not found on PATH."
+    }
+
+    Push-Location $Repository
+
+    try {
+
+        $gitRoot = (& git rev-parse --show-toplevel 2>&1).Trim()
+
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitRoot)) {
+            throw "The directory is not recognised as a Git repository: $Repository"
+        }
+
+        $gitRootFull = [IO.Path]::GetFullPath($gitRoot).TrimEnd('\')
+
+        if ($gitRootFull -ne $Repository) {
+            throw @"
+Git repository root does not match expected repository path.
+
+Expected: $Repository
+Actual:   $gitRootFull
+"@
+        }
+
+        # --------------------------------------------------------
+        # Capture HEAD before reset
+        # --------------------------------------------------------
+
+        $headCommit = (& git rev-parse HEAD 2>&1).Trim()
+
+        if (
+            $LASTEXITCODE -ne 0 -or
+            [string]::IsNullOrWhiteSpace($headCommit)
+        ) {
+            throw "Unable to determine the current Git HEAD."
+        }
+
+        Write-Host "[GIT] HEAD: $headCommit" -ForegroundColor DarkGray
+
+        # --------------------------------------------------------
+        # Stop only processes using this repository
+        # --------------------------------------------------------
+
+        Stop-ProcessesUsingRepository `
+            -RepositoryPath $Repository
+
+        # --------------------------------------------------------
+        # Reset tracked files
+        # --------------------------------------------------------
+
+        Write-Host "[RESET] Restoring tracked files to HEAD..." -ForegroundColor DarkGray
+
+        $resetOutput = & git reset --hard HEAD 2>&1
+
+        foreach ($line in $resetOutput) {
+            Write-Host $line
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "git reset --hard HEAD failed."
+        }
+
+        # --------------------------------------------------------
+        # Remove untracked files/directories.
+        #
+        # IMPORTANT:
+        # Keep runner infrastructure outside the actual exercise
+        # source tree.
+        # --------------------------------------------------------
+
+        Write-Host "[RESET] Removing untracked repository files..." -ForegroundColor DarkGray
+
+        $cleanOutput = & git clean -fd `
+            --exclude=.codex/ `
+            --exclude=.results/ `
+            --exclude=run.ps1 `
+            --exclude=REFACTORING-TASK.md `
+            2>&1
+
+        foreach ($line in $cleanOutput) {
+            Write-Host $line
+        }
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "git clean -fd failed."
+        }
+
+        # --------------------------------------------------------
+        # Remove generated build/test output
+        # --------------------------------------------------------
+
+        Write-Host "[RESET] Removing generated build/test output..." -ForegroundColor DarkGray
+
+        Get-ChildItem `
+            -LiteralPath $Repository `
+            -Directory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -in @(
+                    "bin",
+                    "obj",
+                    "BenchmarkDotNet.Artifacts"
+                )
+            } |
+            Sort-Object FullName -Descending |
+            ForEach-Object {
+
+                try {
+                    Remove-Item `
+                        -LiteralPath $_.FullName `
+                        -Recurse `
+                        -Force `
+                        -ErrorAction Stop
+                }
+                catch {
+                    Write-Host `
+                        "[WARN] Could not remove: $($_.FullName)" `
+                        -ForegroundColor Yellow
                 }
             }
-            else {
-                Copy-Item -LiteralPath (Join-Path $SampleRepository "*") `
-                    -Destination $BaselineRepository -Recurse -Force -ErrorAction Stop
-            }
 
-            Write-Host "[OK] original-repository baseline created." -ForegroundColor Green
+        # --------------------------------------------------------
+        # Verify repository status
+        # --------------------------------------------------------
+
+        Write-Host "[VERIFY] Checking repository status..." -ForegroundColor DarkGray
+
+        $status = (& git status --porcelain 2>&1)
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to determine Git repository status."
+        }
+
+        if ($status) {
+
+            Write-Host `
+                "[WARN] Repository still contains changes:" `
+                -ForegroundColor Yellow
+
+            foreach ($line in $status) {
+                Write-Host "       $line" -ForegroundColor Yellow
+            }
         }
         else {
-            Write-Host "[ERROR] Neither original-repository nor sample-repository exists." -ForegroundColor Red
-            Write-Host "        The exercise ZIP must contain the initial sample-repository." -ForegroundColor Yellow
-            throw "Missing exercise baseline and sample repository."
+            Write-Host "[OK] Git working tree is clean." -ForegroundColor Green
         }
-    }
 
-    $baselineFull = [IO.Path]::GetFullPath($BaselineRepository).TrimEnd('\')
-    $sampleFull = [IO.Path]::GetFullPath($SampleRepository).TrimEnd('\')
+        # --------------------------------------------------------
+        # Verify HEAD did not change
+        # --------------------------------------------------------
 
-    if ($baselineFull -eq $sampleFull) {
-        throw "Safety check failed: original-repository and sample-repository must be different directories."
-    }
+        $currentHead = (& git rev-parse HEAD 2>&1).Trim()
 
-    # The baseline is immutable. The sample directory is disposable.
-    if (Test-Path -LiteralPath $SampleRepository) {
-        Write-Host "[RESET] Removing previous sample-repository..." -ForegroundColor DarkGray
+        if ($currentHead -ne $headCommit) {
+            throw @"
+Repository reset verification failed.
 
-        Get-Process -Name "dotnet","codex" -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
-
-        Remove-Item -LiteralPath $SampleRepository -Recurse -Force -ErrorAction Stop
-    }
-
-    Write-Host "[RESET] Copying pristine baseline..." -ForegroundColor DarkGray
-    New-Item -ItemType Directory -Path $SampleRepository -Force | Out-Null
-
-    $robocopy = Get-Command robocopy.exe -ErrorAction SilentlyContinue
-    if ($robocopy) {
-        & $robocopy.Source $BaselineRepository $SampleRepository /E /R:2 /W:1 /XJ /NFL /NDL /NJH /NJS
-        $rc = $LASTEXITCODE
-        if ($rc -ge 8) {
-            throw "Robocopy failed with exit code $rc."
+Original HEAD : $headCommit
+Current HEAD  : $currentHead
+"@
         }
+
+        # --------------------------------------------------------
+        # Final repository validation
+        # --------------------------------------------------------
+
+        if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
+            throw "Repository reset completed but solution file is missing: $solutionPath"
+        }
+
+        if (-not (Test-Path -LiteralPath $srcPath -PathType Container)) {
+            throw "Repository reset completed but src directory is missing: $srcPath"
+        }
+
+        if (-not (Test-Path -LiteralPath $testPath -PathType Container)) {
+            throw "Repository reset completed but tests directory is missing: $testPath"
+        }
+
+        Write-Host ""
+        Write-Host "[OK] Repository restored to Git HEAD." -ForegroundColor Green
+        Write-Host "     Commit  : $headCommit" -ForegroundColor DarkGray
+        Write-Host "     Solution: $solutionPath" -ForegroundColor DarkGray
+        Write-Host "     Source  : $srcPath" -ForegroundColor DarkGray
+        Write-Host "     Tests   : $testPath" -ForegroundColor DarkGray
+
+        return $headCommit
     }
-    else {
-        Copy-Item -LiteralPath (Join-Path $BaselineRepository "*") `
-            -Destination $SampleRepository -Recurse -Force -ErrorAction Stop
+    finally {
+        Pop-Location
     }
-
-    # Always start the working copy without previous build output.
-    Get-ChildItem -LiteralPath $SampleRepository -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -in @("bin", "obj") } |
-        Sort-Object FullName -Descending |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-    $requiredProject = Join-Path $SampleRepository "src\OrderProcessing\OrderProcessing.csproj"
-    $requiredSolution = Join-Path $SampleRepository "OrderProcessing.sln"
-
-    if (-not (Test-Path -LiteralPath $requiredProject -PathType Leaf)) {
-        throw "Reset completed but the expected project was not found: $requiredProject"
-    }
-
-    if (-not (Test-Path -LiteralPath $requiredSolution -PathType Leaf)) {
-        throw "Reset completed but the expected solution was not found: $requiredSolution"
-    }
-
-    Write-Host "[OK] sample-repository restored from original-repository." -ForegroundColor Green
 }
 
 function Test-PredefinedAgents {
