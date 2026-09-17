@@ -325,15 +325,13 @@ function Stop-ProcessesUsingRepository {
 
 function Reset-RepositoryToCommittedState {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$RepositoryPath
-    )
+    param()
 
     Write-Host ""
     Write-Host "Resetting Working Repository to Git HEAD" -ForegroundColor Cyan
 
-    $Repository = [IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
+    # Always use the directory containing this script; never prompt for a repository path.
+    $Repository = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
 
     # ------------------------------------------------------------
     # Validate repository location
