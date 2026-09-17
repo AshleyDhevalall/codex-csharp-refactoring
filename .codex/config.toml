@@ -1,0 +1,12 @@
+model = "gpt-5.6-sol"
+model_provider = "openai"
+
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[agents]
+max_threads = 4
+max_depth = 1
+
+[projects.'c:\projects\codex\complex-csharp-refactoring-exercise']
+trust_level = "trusted"
