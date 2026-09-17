@@ -3,18 +3,8 @@
 [![.NET 8](https://img.shields.io/badge/.NET-8-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
 [![C#](https://img.shields.io/badge/C%23-12-239120?logo=csharp&logoColor=white)](https://learn.microsoft.com/dotnet/csharp/)
 [![OpenAI Codex](https://img.shields.io/badge/OpenAI-Codex-412991?logo=openai&logoColor=white)](https://openai.com/codex/)
-[![Tests](https://img.shields.io/badge/tests-72%20passed-success)](#verification)
-[![Build](https://img.shields.io/badge/build-0%20warnings%20%7C%200%20errors-success)](#verification)
 
 An AI-assisted C# refactoring exercise that uses **OpenAI Codex**, a configurable multi-agent review process, automated repository reset, and independent .NET verification.
-
-The goal is not simply to make the code compile. The workflow asks specialist agents to analyse the existing solution, improve its design and test coverage, and then independently verifies the resulting repository with `dotnet restore`, `dotnet build`, and `dotnet test`.
-
-> **Current reference run:** 17 September 2026  
-> **Model:** `gpt-5.6-sol`  
-> **Codex CLI:** `0.154.0`  
-> **Result:** 72 tests passed, 0 failed, 0 skipped  
-> **Estimated API cost:** `$0.6855`
 
 ---
 
