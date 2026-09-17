@@ -9,14 +9,23 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 $CodexHome = Join-Path $ProjectRoot ".codex"
 $AgentsDirectory = Join-Path $CodexHome "agents"
-$SampleRepository = $ProjectRoot
+$Repository = $ProjectRoot
 $TaskFile = Join-Path $ProjectRoot "REFACTORING-TASK.md"
 
-$RunRoot = Join-Path $ProjectRoot ".codex-run"
+# ============================================================
+# All generated result/output files are stored under .results
+# ============================================================
+$ResultsDirectory = Join-Path $ProjectRoot ".results"
+$RunRoot = Join-Path $ResultsDirectory ".codex-run"
 
-$JsonLogFile = Join-Path $ProjectRoot "codex-run.jsonl"
-$FinalResponseFile = Join-Path $ProjectRoot "codex-final-response.txt"
-$ResultsFile = Join-Path $ProjectRoot "results.md"
+$JsonLogFile = Join-Path $ResultsDirectory "codex-run.jsonl"
+$FinalResponseFile = Join-Path $ResultsDirectory "codex-final-response.txt"
+$ResultsFile = Join-Path $ResultsDirectory "results.md"
+
+# Ensure the results directory exists before any output is written.
+if (-not (Test-Path -LiteralPath $ResultsDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
+}
 
 $Model = "gpt-5.6-sol"
 $ResetRepositoryBeforeRun = $true
@@ -232,7 +241,8 @@ function Remove-PreviousRunFiles {
     $Files = @(
         $JsonLogFile,
         $FinalResponseFile,
-        $ResultsFile
+        $ResultsFile,
+        (Join-Path $ResultsDirectory ".codex-run.pid")
     )
 
     foreach ($File in $Files) {
@@ -259,7 +269,7 @@ function Remove-PreviousRunFiles {
 function Stop-ProcessesUsingRepository {
     param([Parameter(Mandatory)][string]$RepositoryPath)
 
-    Write-Host "[RESET] Checking for processes using sample-repository..." -ForegroundColor Gray
+    Write-Host "[RESET] Checking for processes using repository..." -ForegroundColor Gray
 
     $FullPath = [System.IO.Path]::GetFullPath($RepositoryPath).TrimEnd('\')
 
@@ -370,7 +380,6 @@ function Reset-RepositoryToCommittedState {
     Push-Location $Repository
 
     try {
-
         $gitRoot = (& git rev-parse --show-toplevel 2>&1).Trim()
 
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitRoot)) {
@@ -380,12 +389,7 @@ function Reset-RepositoryToCommittedState {
         $gitRootFull = [IO.Path]::GetFullPath($gitRoot).TrimEnd('\')
 
         if ($gitRootFull -ne $Repository) {
-            throw @"
-Git repository root does not match expected repository path.
-
-Expected: $Repository
-Actual:   $gitRootFull
-"@
+            throw "Git repository root does not match expected repository path.`nExpected: $Repository`nActual:   $gitRootFull"
         }
 
         # --------------------------------------------------------
@@ -394,71 +398,80 @@ Actual:   $gitRootFull
 
         $headCommit = (& git rev-parse HEAD 2>&1).Trim()
 
-        if (
-            $LASTEXITCODE -ne 0 -or
-            [string]::IsNullOrWhiteSpace($headCommit)
-        ) {
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headCommit)) {
             throw "Unable to determine the current Git HEAD."
         }
 
         Write-Host "[GIT] HEAD: $headCommit" -ForegroundColor DarkGray
 
+        $branch = (& git branch --show-current 2>&1).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($branch)) {
+            Write-Host "[GIT] Repository is in detached HEAD state." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "[GIT] Branch: $branch" -ForegroundColor DarkGray
+        }
+
         # --------------------------------------------------------
-        # Stop only processes using this repository
+        # Only reset the actual C# exercise files.
+        #
+        # These files/directories belong to the runner and must
+        # NEVER be reverted or removed by this function:
+        #   run.ps1
+        #   README.md
+        #   REFACTORING-TASK.md
+        #   .codex\
+        #   .results\
         # --------------------------------------------------------
 
-        Stop-ProcessesUsingRepository `
-            -RepositoryPath $Repository
+        Write-Host "[RESET] Stopping processes using the repository..." -ForegroundColor DarkGray
+
+        Stop-ProcessesUsingRepository -RepositoryPath $Repository
 
         # --------------------------------------------------------
-        # Reset tracked files
+        # Reset tracked exercise files only.
         # --------------------------------------------------------
 
-        Write-Host "[RESET] Restoring tracked files to HEAD..." -ForegroundColor DarkGray
+        Write-Host "[RESET] Restoring tracked exercise files to HEAD..." -ForegroundColor DarkGray
 
-        $resetOutput = & git reset --hard HEAD 2>&1
+        $restoreOutput = & git restore --source=HEAD --staged --worktree -- OrderProcessing.sln src tests 2>&1
 
-        foreach ($line in $resetOutput) {
+        foreach ($line in $restoreOutput) {
             Write-Host $line
         }
 
         if ($LASTEXITCODE -ne 0) {
-            throw "git reset --hard HEAD failed."
+            throw "git restore from HEAD for the exercise files failed."
         }
 
         # --------------------------------------------------------
-        # Remove untracked files/directories.
+        # Remove untracked exercise files/directories only.
         #
-        # IMPORTANT:
-        # Keep runner infrastructure outside the actual exercise
-        # source tree.
+        # This deliberately does NOT run git clean against the
+        # repository root, so runner files cannot be deleted.
         # --------------------------------------------------------
 
-        Write-Host "[RESET] Removing untracked repository files..." -ForegroundColor DarkGray
+        Write-Host "[RESET] Removing untracked exercise files..." -ForegroundColor DarkGray
 
-        $cleanOutput = & git clean -fd `
-            --exclude=.codex/ `
-            --exclude=.results/ `
-            --exclude=run.ps1 `
-            --exclude=REFACTORING-TASK.md `
-            2>&1
+        $cleanOutput = & git clean -fd -- src tests OrderProcessing.sln 2>&1
 
         foreach ($line in $cleanOutput) {
             Write-Host $line
         }
 
         if ($LASTEXITCODE -ne 0) {
-            throw "git clean -fd failed."
+            throw "git clean for the exercise files failed."
         }
 
         # --------------------------------------------------------
-        # Remove generated build/test output
+        # Remove generated build/test output from the exercise.
         # --------------------------------------------------------
 
         Write-Host "[RESET] Removing generated build/test output..." -ForegroundColor DarkGray
 
         Get-ChildItem `
-            -LiteralPath $Repository `
+            -LiteralPath $srcPath `
             -Directory `
             -Recurse `
             -Force `
@@ -472,7 +485,6 @@ Actual:   $gitRootFull
             } |
             Sort-Object FullName -Descending |
             ForEach-Object {
-
                 try {
                     Remove-Item `
                         -LiteralPath $_.FullName `
@@ -481,55 +493,79 @@ Actual:   $gitRootFull
                         -ErrorAction Stop
                 }
                 catch {
-                    Write-Host `
-                        "[WARN] Could not remove: $($_.FullName)" `
-                        -ForegroundColor Yellow
+                    Write-Host "[WARN] Could not remove: $($_.FullName)" -ForegroundColor Yellow
+                }
+            }
+
+        Get-ChildItem `
+            -LiteralPath $testPath `
+            -Directory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -in @(
+                    "bin",
+                    "obj",
+                    "BenchmarkDotNet.Artifacts"
+                )
+            } |
+            Sort-Object FullName -Descending |
+            ForEach-Object {
+                try {
+                    Remove-Item `
+                        -LiteralPath $_.FullName `
+                        -Recurse `
+                        -Force `
+                        -ErrorAction Stop
+                }
+                catch {
+                    Write-Host "[WARN] Could not remove: $($_.FullName)" -ForegroundColor Yellow
                 }
             }
 
         # --------------------------------------------------------
-        # Verify repository status
+        # Verify protected runner files still exist.
         # --------------------------------------------------------
 
-        Write-Host "[VERIFY] Checking repository status..." -ForegroundColor DarkGray
+        $ProtectedFiles = @(
+            (Join-Path $Repository "run.ps1"),
+            (Join-Path $Repository "README.md"),
+            (Join-Path $Repository "REFACTORING-TASK.md")
+        )
 
-        $status = (& git status --porcelain 2>&1)
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to determine Git repository status."
-        }
-
-        if ($status) {
-
-            Write-Host `
-                "[WARN] Repository still contains changes:" `
-                -ForegroundColor Yellow
-
-            foreach ($line in $status) {
-                Write-Host "       $line" -ForegroundColor Yellow
+        foreach ($ProtectedFile in $ProtectedFiles) {
+            if (-not (Test-Path -LiteralPath $ProtectedFile -PathType Leaf)) {
+                throw "Protected runner file is missing after reset: $ProtectedFile"
             }
         }
-        else {
-            Write-Host "[OK] Git working tree is clean." -ForegroundColor Green
+
+        if (-not (Test-Path -LiteralPath (Join-Path $Repository ".codex") -PathType Container)) {
+            throw "Protected .codex directory is missing after reset."
+        }
+
+        if (-not (Test-Path -LiteralPath (Join-Path $Repository ".results") -PathType Container)) {
+            New-Item -ItemType Directory -Path (Join-Path $Repository ".results") -Force | Out-Null
         }
 
         # --------------------------------------------------------
-        # Verify HEAD did not change
+        # Verify HEAD has not changed.
         # --------------------------------------------------------
 
         $currentHead = (& git rev-parse HEAD 2>&1).Trim()
 
         if ($currentHead -ne $headCommit) {
-            throw @"
-Repository reset verification failed.
-
-Original HEAD : $headCommit
-Current HEAD  : $currentHead
-"@
+            throw "Repository reset verification failed.`nOriginal HEAD : $headCommit`nCurrent HEAD  : $currentHead"
         }
 
         # --------------------------------------------------------
-        # Final repository validation
+        # Verify protected files were not modified by the reset.
+        # --------------------------------------------------------
+
+        Write-Host "[VERIFY] Protected runner files remain outside reset scope." -ForegroundColor DarkGray
+
+        # --------------------------------------------------------
+        # Final repository validation.
         # --------------------------------------------------------
 
         if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
@@ -545,11 +581,12 @@ Current HEAD  : $currentHead
         }
 
         Write-Host ""
-        Write-Host "[OK] Repository restored to Git HEAD." -ForegroundColor Green
+        Write-Host "[OK] Exercise repository restored to Git HEAD." -ForegroundColor Green
         Write-Host "     Commit  : $headCommit" -ForegroundColor DarkGray
         Write-Host "     Solution: $solutionPath" -ForegroundColor DarkGray
         Write-Host "     Source  : $srcPath" -ForegroundColor DarkGray
         Write-Host "     Tests   : $testPath" -ForegroundColor DarkGray
+        Write-Host "     Protected: run.ps1, README.md, REFACTORING-TASK.md, .codex, .results" -ForegroundColor DarkGray
 
         return $headCommit
     }
@@ -600,7 +637,7 @@ function Invoke-DotNet {
     $Psi = New-Object System.Diagnostics.ProcessStartInfo
     $Psi.FileName = "dotnet.exe"
     $Psi.Arguments = $Arguments
-    $Psi.WorkingDirectory = $SampleRepository
+    $Psi.WorkingDirectory = $Repository
     $Psi.UseShellExecute = $false
     $Psi.CreateNoWindow = $true
     $Psi.RedirectStandardOutput = $true
@@ -806,6 +843,7 @@ Write-Host "Codex Refactoring Exercise Starting" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "Project Root : $ProjectRoot"
 Write-Host "CODEX_HOME   : $CodexHome"
+Write-Host "Results      : $ResultsDirectory"
 Write-Host "Model        : $Model"
 Write-Host ""
 
@@ -813,8 +851,8 @@ if (-not (Test-Path -LiteralPath $ProjectRoot -PathType Container)) {
     Fail "Project root does not exist."
 }
 
-if (-not (Test-Path -LiteralPath $SampleRepository -PathType Container)) {
-    Fail "sample-repository does not exist: $SampleRepository"
+if (-not (Test-Path -LiteralPath $Repository -PathType Container)) {
+    Fail "Repository does not exist: $Repository"
 }
 
 if (-not (Test-Path -LiteralPath $TaskFile -PathType Leaf)) {
@@ -829,8 +867,12 @@ if (-not (Test-CommandExists "dotnet")) {
     Fail ".NET SDK is not installed or is not available in PATH."
 }
 
+if (-not (Test-Path -LiteralPath $ResultsDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
+}
+
 # ============================================================
-# Clean previous top-level compatibility files
+# Clean previous result files
 # ============================================================
 
 Remove-PreviousRunFiles
@@ -895,12 +937,11 @@ Test-PredefinedAgents
 # ============================================================
 
 if ($ResetRepositoryBeforeRun) {
-    $StartingCommit = Reset-RepositoryToCommittedState `
-        -RepositoryPath $SampleRepository
+    $StartingCommit = Reset-RepositoryToCommittedState
 }
 else {
 
-    Push-Location $SampleRepository
+    Push-Location $Repository
 
     try {
         $StartingCommit = (git rev-parse HEAD 2>&1) -join ""
@@ -938,7 +979,7 @@ $Prompt = @"
 You are the lead/orchestrator for a multi-agent C# refactoring exercise.
 
 WORKING REPOSITORY:
-$SampleRepository
+$Repository
 
 TASK SPECIFICATION:
 ------------------------------------------------------------
@@ -1002,6 +1043,15 @@ REQUIRED WORKFLOW
 
 5. Implement the required refactoring and functionality.
 
+   Test and benchmark placement rules:
+   - All BenchmarkDotNet benchmark projects MUST be created under:
+     tests\\benchmarks\\
+   - All unit test projects and unit test files MUST be created under:
+     tests\\unit tests\\
+   - Do NOT create benchmark projects in a repository-level `benchmarks` folder.
+   - Do NOT create unit tests directly under `tests\\` or in any other test folder.
+   - Keep benchmark code separate from unit/integration test code.
+
 6. Use the test-engineer again after implementation to review:
    - unit test coverage
    - integration coverage
@@ -1041,7 +1091,7 @@ REPOSITORY SAFETY
 
 Only modify files inside:
 
-$SampleRepository
+$Repository
 
 Do NOT modify:
 
@@ -1133,7 +1183,7 @@ Write-Host "[OK] Multi-agent prompt created." -ForegroundColor Green
 
 Write-Section "Running Codex Refactoring"
 
-Write-Host "Working directory: $SampleRepository"
+Write-Host "Working directory: $Repository"
 Write-Host "Model            : $Model"
 Write-Host "CODEX_HOME       : $CodexHome"
 Write-Host "Prompt transport : stdin"
@@ -1166,7 +1216,7 @@ Set-Content -LiteralPath $RunnerCmdFile -Value $CmdContent -Encoding ASCII
 $ProcessStartInfo = New-Object System.Diagnostics.ProcessStartInfo
 $ProcessStartInfo.FileName = "cmd.exe"
 $ProcessStartInfo.Arguments = "/d /c `"$RunnerCmdFile`""
-$ProcessStartInfo.WorkingDirectory = $SampleRepository
+$ProcessStartInfo.WorkingDirectory = $Repository
 $ProcessStartInfo.UseShellExecute = $false
 $ProcessStartInfo.CreateNoWindow = $true
 $ProcessStartInfo.Environment["CODEX_HOME"] = $CodexHome
@@ -1175,7 +1225,7 @@ $ProcessStartInfo.Environment["CODEX_API_KEY"] = $env:CODEX_API_KEY
 $CodexProcess = New-Object System.Diagnostics.Process
 $CodexProcess.StartInfo = $ProcessStartInfo
 
-$RunnerPidFile = Join-Path $ProjectRoot ".codex-run.pid"
+$RunnerPidFile = Join-Path $ResultsDirectory ".codex-run.pid"
 Set-Content -LiteralPath $RunnerPidFile -Value $PID -Encoding ASCII
 
 $StdOutOffset = 0L
@@ -1321,7 +1371,7 @@ Write-Host "[CODEX] Process completed." -ForegroundColor Cyan
 Write-Host "Exit code: $CodexExitCode"
 Write-Host "Duration : $($Duration.ToString("hh\:mm\:ss"))"
 
-# Copy main JSONL/final response to compatibility paths.
+# Copy main JSONL/final response to the .results directory.
 if (Test-Path -LiteralPath $StdOutFile) {
     Copy-Item -LiteralPath $StdOutFile -Destination $JsonLogFile -Force
 }
@@ -1525,6 +1575,10 @@ $ResultsContent = @"
 
 `REFACTORING-TASK.md` was verified unchanged.
 
+## Results Directory
+
+`$ResultsDirectory`
+
 ## Execution Directory
 
 `$ExecutionDirectory`
@@ -1559,7 +1613,9 @@ Write-Host "Test Status      : $TestStatus"
 Write-Host ""
 Write-Host "Estimated Cost   : `$$((Format-Currency $TotalEstimatedCost))"
 Write-Host ""
-Write-Host "Results:"
+Write-Host "Results Directory:"
+Write-Host "  $ResultsDirectory"
+Write-Host "Results File:"
 Write-Host "  $ResultsFile"
 Write-Host ""
 Write-Host "Execution Logs:"
